@@ -1,34 +1,23 @@
-#include <limits>
-#include <cstddef>
+#include <algorithm>
 #include <arpa/inet.h>
+#include <cstddef>
+#include <fcntl.h>
 #include <iostream>
+#include <limits>
+#include <linux/if.h>
+#include <linux/if_tun.h>
 #include <map>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-// IP
-// 0                   1                   2                   3
-// 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |Version|  IHL  |Type of Service|          Total Length         |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |         Identification        |Flags|      Fragment Offset    |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |  Time to Live |    Protocol   |         Header Checksum       |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                       Source Address                          |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                    Destination Address                        |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                    Options                    |    Padding    |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
+#include "yatou.h"
 
 #define DEBUG true
 #define DEFAULT_MAX_CONNECTIONS 1024
@@ -37,149 +26,198 @@ typedef uint8_t u8;
 typedef uint16_t u16;
 typedef uint32_t u32;
 typedef uint64_t u64;
+typedef unsigned long ip4_addr_t;
 
 
-// ======================================================================
-// Error handling
-
-class Error : std::exception {
-private:
-    std::string message_;
-public:
-    Error(std::string message) : message_(message) { }
-    std::string toString() { return message_; }
-};
-
-// ======================================================================
-// TCP
-//
-// 0                   1                   2                   3
-// 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |          Source Port          |       Destination Port        |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                        Sequence Number                        |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                    Acknowledgment Number                      |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |  Data |           |U|A|P|R|S|F|                               |
-// | Offset| Reserved  |R|C|S|S|Y|I|            Window             |
-// |       |           |G|K|H|T|N|N|                               |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |           Checksum            |         Urgent Pointer        |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                    Options                    |    Padding    |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-// |                             data                              |
-// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-
-typedef struct tcp_header {
-    unsigned short  source;
-    unsigned short  dest;
-    unsigned int    seq;
-    unsigned int    ack_seq;
-    unsigned short  doff: 4,
-        res1: 4,
-        cwr: 1,
-        ece: 1,
-        urg: 1,
-        ack: 1,
-        psh: 1,
-        rst: 1,
-        syn: 1,
-        fin: 1;
-    unsigned  short  window;
-    unsigned short  check;
-    unsigned short  urg_ptr;
-    unsigned int    options: 24,
-        padding: 8;
-} tcp_header_t;
-
-
-typedef struct tcp_data {
-        tcp_header_t*   header;
-        unsigned char*  data;
-        unsigned int    data_len;
-} tcp_data_t;
-
-// ======================================================================
-// Global setup
-
-
-namespace Yatou {
-    typedef uint16_t port_t;
-    typedef uint32_t socket_t;
-
-    int socket_;
-    std::map<port_t, socket_t> sockets;
-
-    void setup(in_addr_t address, u32 port);
-    int socket();
-    int teardown();
-
-};
-
-void Yatou::setup(in_addr_t address, u32 port)
+/*
+ * set_ip(): Sets the ip for the interface in *ifr and sets the subnet
+ *           mask if provided
+ */
+void set_ip(struct ifreq *ifr,
+            int sockfd,
+            const char* inet_address,
+            const char* subnet)
 {
-    // don't initialize twice
-    if (socket_ > 0) {
-        return;
+    struct sockaddr_in inet_addr, subnet_mask;
+
+    /// prepare address
+    inet_addr.sin_family = AF_INET;
+    if (inet_pton(AF_INET, inet_address, &(inet_addr.sin_addr)) != 1) {
+        throw Yatou::Error("Invalid inet_address");
     }
 
-    // create yatou socket
-    if ((socket_ = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) <= 0) {
-        throw Error(std::string("Unable to create yatou socket: ")
-                    + strerror(errno));
-    } else {
-        std::cout << "created yatou socket" << std::endl;
+    /// prepare subnet mask
+    subnet_mask.sin_family = AF_INET;
+    if (inet_pton(AF_INET, subnet, &(subnet_mask.sin_addr)) != 1) {
+        throw Yatou::Error("Invalid subnet mask");
     }
 
-    // construct address info
-    struct sockaddr_in address_info;
-    memset(&address_info, 0, sizeof(address_info));
-    address_info.sin_family = AF_INET;
-    address_info.sin_addr.s_addr = htonl(address);
-    address_info.sin_port = htons(port);
-    struct sockaddr* addr_info = ((struct sockaddr*)& address_info);
-
-    // bind yatou socket
-    if (::bind(socket_, addr_info, sizeof(address_info)) < 0) {
-        throw Error(std::string("Unable to bind yatou socket ")
-                    + strerror(errno));
-    } else {
-        std::cout << "bound yatou socket " << std::endl;
+    /// put addr in ifr structure
+    memcpy(&(ifr->ifr_addr), &inet_addr, sizeof (struct sockaddr));
+    if (ioctl(sockfd, SIOCSIFADDR, ifr) < 0) {
+        throw Yatou::Error("Unable to set IP address");
     }
-}
 
-// int Yatou::socket()
-// {
-//     socket_t next_socket;
-//     for (next_socket = 0;
-//          next_socket < std::numeric_limits<socket_t>::max();
-//          next_socket++) {
-
-//     }
-// }
-
-
-int Yatou::teardown()
-{
-    if (socket_ > 0) {
-        if (close(socket_)) {
-            std::cerr << "unable to close global socket" << std::endl;
-            return 1;
+    /// put mask in ifr structure
+    if (subnet) {
+        memcpy(&(ifr->ifr_addr), &subnet_mask, sizeof (struct sockaddr));
+        if(ioctl(sockfd, SIOCSIFNETMASK, ifr) < 0) {
+            throw Yatou::Error("Unable to set subnet mask");
         }
-        std::cout << "closed yatou socket" << std::endl;
     }
-    return 0;
 }
 
-int main(int argc, char *argv[])
+
+/*
+ *  Yatou::setup_tun() - Creates TUN device
+ *
+ *  returns: file descriptor to TUN clone
+ */
+void Yatou::setup()
+{
+    // Setup has already succeeded, don't retry
+    if (yatou_fd_) { return; }
+
+    // location of the clone device
+    const char *clonedev = "/dev/net/tun";
+    // interface request structure
+    struct ifreq ifr;
+    // name of our TUN device
+    char device[IFNAMSIZ];
+    strcpy(device, "yatou");
+
+    int err;
+    int flags = IFF_TUN;
+
+    /* open the clone device */
+    if( (yatou_fd_ = open(clonedev, O_RDWR)) < 0 ) {
+        throw Error(std::string("Unable to open clone device"));
+    }
+
+    std::cout << "opened clone device: " << yatou_fd_ << std::endl;
+
+    /* preparation of the struct ifr, of type "struct ifreq" */
+    memset(&ifr, 0, sizeof(ifr));
+
+    ifr.ifr_flags = flags;   /* IFF_TUN or IFF_TAP, plus maybe IFF_NO_PI */
+
+    if (*device) {
+        /* if a device name was specified, put it in the structure; otherwise,
+         * the kernel will try to allocate the "next" device of the
+         * specified type */
+        strncpy(ifr.ifr_name, device, IFNAMSIZ);
+    }
+
+    /* try to create the device */
+    if( (err = ioctl(yatou_fd_, TUNSETIFF, (void *) &ifr)) < 0 ) {
+        std::cout << "failed" << std::endl;
+        close(yatou_fd_);
+        throw Error(std::string("Unable to create TUN device"));
+    }
+
+    /* if the operation was successful, write back the name of the
+     * interface to the variable "dev", so the caller can know
+     * it. Note that the caller MUST reserve space in *dev (see calling
+     * code below) */
+    strcpy((char*)device, ifr.ifr_name);
+
+    std::cout << "removing persistent status" << std::endl;
+
+    /* remove persistent status */
+    if(ioctl(yatou_fd_, TUNSETPERSIST, 0) < 0){
+        perror("disabling TUNSETPERSIST");
+        exit(1);
+    }
+
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        throw Yatou::Error("Cannot open udp socket");
+    }
+
+    set_ip2(&ifr, sock, "10.0.0.1", "255.255.255.0");
+
+    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+        throw Yatou::Error("SIOCGIFFLAGS");
+    }
+
+    ifr.ifr_flags |= IFF_UP;
+    ifr.ifr_flags |= IFF_RUNNING;
+
+    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0)  {
+        throw Yatou::Error("SIOCSIFFLAGS");
+    }
+}
+
+
+void print_hex(char* buffer, size_t len)
+{
+    int width = 0;
+    for (size_t i = 0; i < len; i++, width++) {
+        printf("%0x ", (unsigned char)buffer[i]);
+        if (width >= 40) {
+            printf("\n");
+            width = 0;
+        }
+    }
+    printf("\n");
+}
+
+void printn(char* buffer, size_t len)
+{
+    int width = 0;
+    for (size_t i = 0; i < len; i++, width++) {
+        printf("%c", (unsigned char)buffer[i]);
+        if (width >= 40) {
+            printf("\n");
+            width = 0;
+        }
+    }
+    printf("\n");
+}
+
+
+void Yatou::teardown()
+{
+    if (yatou_fd_) {
+        close(yatou_fd_);
+    }
+}
+
+void startServer()
+{
+    Yatou::setup();
+    int nread;
+    char buffer[2048];
+
+    int count = 0;
+
+    std::cout << "reading from fd" << std::endl;
+    while(1) {
+        nread = read(Yatou::yatou_fd_, buffer, sizeof(buffer));
+
+        if(nread < 0) {
+            perror("Reading from interface");
+            close(Yatou::yatou_fd_);
+            exit(1);
+        }
+
+        printf("%d: Read %d bytes from device\n", count, nread);
+        print_hex(buffer, nread);
+
+        if (count++ > 10) {
+            break;
+        }
+    }
+
+    Yatou::teardown();
+}
+
+
+int main()
 {
     try {
-        Yatou::setup(INADDR_ANY, 9000);
-        Yatou::teardown();
-    } catch (Error error) {
+        startServer();
+    } catch (Yatou::Error error) {
         std::cout << error.toString() << std::endl;
     }
 }
