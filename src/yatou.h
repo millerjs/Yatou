@@ -20,6 +20,15 @@ namespace Yatou {
         std::string toString() { return message_; }
     };
 
+    struct ifreq create_tun(std::string device_name);
+
+    void set_if_ip(struct ifreq *ifr,
+                   int sockfd,
+                   const char* inet_address,
+                   const char* subnet);
+
+    void Yatou::set_if_up(struct ifreq *ifr, int sockfd);
+
     void setup();
     void teardown();
 }

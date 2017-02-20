@@ -30,13 +30,13 @@ typedef unsigned long ip4_addr_t;
 
 
 /*
- * set_ip(): Sets the ip for the interface in *ifr and sets the subnet
- *           mask if provided
+ * set_if_ip(): Sets the ip for the interface in *ifr and sets the
+ *              subnet mask if provided
  */
-void set_ip(struct ifreq *ifr,
-            int sockfd,
-            const char* inet_address,
-            const char* subnet)
+void Yatou::set_if_ip(struct ifreq *ifr,
+                      int sockfd,
+                      const char* inet_address,
+                      const char* subnet)
 {
     struct sockaddr_in inet_addr, subnet_mask;
 
@@ -67,6 +67,57 @@ void set_ip(struct ifreq *ifr,
     }
 }
 
+/*
+ * set_if_up(): Marks the interface "up"
+ */
+void Yatou::set_if_up(struct ifreq *ifr, int sockfd)
+{
+    ifr->ifr_flags |= IFF_UP;
+    ifr->ifr_flags |= IFF_RUNNING;
+
+    if (ioctl(sockfd, SIOCSIFFLAGS, ifr) < 0)  {
+        throw Yatou::Error("SIOCSIFFLAGS");
+    }
+}
+
+
+/*
+ *  Yatou::create_tun() - Creates a new TUN device
+ */
+struct ifreq Yatou::create_tun(std::string device_name)
+{
+    char tun_device_name[IFNAMSIZ];
+    const char *clonedev = "/dev/net/tun";
+    struct ifreq ifr;
+
+    // open the clone device
+    yatou_fd_ = open(clonedev, O_RDWR);
+    if (yatou_fd_ < 0) {
+        throw Error("Unable to open clone device");
+    }
+
+    // prepare ifr struct
+    memset(&ifr, 0, sizeof(ifr));
+
+    // set the flags to create a TUN device
+    ifr.ifr_flags = IFF_TUN;
+
+    // prepare the name for the TUN device
+    strcpy(tun_device_name, device_name.c_str());
+    strncpy(ifr.ifr_name, tun_device_name, IFNAMSIZ);
+
+    // create the TUN device
+    if (ioctl(yatou_fd_, TUNSETIFF, (void *) &ifr) < 0) {
+        throw Error(std::string("Unable to create TUN device"));
+    }
+
+    // remove persistent status
+    if(ioctl(yatou_fd_, TUNSETPERSIST, 0) < 0){
+        throw Error(std::string("Failed to disable TUN persist"));
+    }
+
+    return ifr;
+}
 
 /*
  *  Yatou::setup_tun() - Creates TUN device
@@ -78,74 +129,15 @@ void Yatou::setup()
     // Setup has already succeeded, don't retry
     if (yatou_fd_) { return; }
 
-    // location of the clone device
-    const char *clonedev = "/dev/net/tun";
-    // interface request structure
-    struct ifreq ifr;
-    // name of our TUN device
-    char device[IFNAMSIZ];
-    strcpy(device, "yatou");
-
-    int err;
-    int flags = IFF_TUN;
-
-    /* open the clone device */
-    if( (yatou_fd_ = open(clonedev, O_RDWR)) < 0 ) {
-        throw Error(std::string("Unable to open clone device"));
-    }
-
-    std::cout << "opened clone device: " << yatou_fd_ << std::endl;
-
-    /* preparation of the struct ifr, of type "struct ifreq" */
-    memset(&ifr, 0, sizeof(ifr));
-
-    ifr.ifr_flags = flags;   /* IFF_TUN or IFF_TAP, plus maybe IFF_NO_PI */
-
-    if (*device) {
-        /* if a device name was specified, put it in the structure; otherwise,
-         * the kernel will try to allocate the "next" device of the
-         * specified type */
-        strncpy(ifr.ifr_name, device, IFNAMSIZ);
-    }
-
-    /* try to create the device */
-    if( (err = ioctl(yatou_fd_, TUNSETIFF, (void *) &ifr)) < 0 ) {
-        std::cout << "failed" << std::endl;
-        close(yatou_fd_);
-        throw Error(std::string("Unable to create TUN device"));
-    }
-
-    /* if the operation was successful, write back the name of the
-     * interface to the variable "dev", so the caller can know
-     * it. Note that the caller MUST reserve space in *dev (see calling
-     * code below) */
-    strcpy((char*)device, ifr.ifr_name);
-
-    std::cout << "removing persistent status" << std::endl;
-
-    /* remove persistent status */
-    if(ioctl(yatou_fd_, TUNSETPERSIST, 0) < 0){
-        perror("disabling TUNSETPERSIST");
-        exit(1);
-    }
+    struct ifreq ifr = create_tun("yatou");
 
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         throw Yatou::Error("Cannot open udp socket");
     }
 
-    set_ip2(&ifr, sock, "10.0.0.1", "255.255.255.0");
-
-    if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
-        throw Yatou::Error("SIOCGIFFLAGS");
-    }
-
-    ifr.ifr_flags |= IFF_UP;
-    ifr.ifr_flags |= IFF_RUNNING;
-
-    if (ioctl(sock, SIOCSIFFLAGS, &ifr) < 0)  {
-        throw Yatou::Error("SIOCSIFFLAGS");
-    }
+    set_if_ip(&ifr, sock, "10.0.0.1", "255.255.255.0");
+    set_if_up(&ifr, sock);
 }
 
 
@@ -219,5 +211,7 @@ int main()
         startServer();
     } catch (Yatou::Error error) {
         std::cout << error.toString() << std::endl;
+        Yatou::teardown();
     }
+    Yatou::teardown();
 }
